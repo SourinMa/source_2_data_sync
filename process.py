@@ -63,10 +63,6 @@ def build_url(config, range_start, range_end):
 # Write a single batch (list of dicts) to CSV incrementally
 # -------------------------------------------------------
 def write_batch_to_csv(file_path, batch, write_header):
-    """
-    Appends a batch of records (list of dicts) to a CSV file.
-    Writes the header only when write_header=True (first batch).
-    """
     if not batch:
         return
 
@@ -96,9 +92,6 @@ def process():
             for config in configs:
                 print(f"\nProcessing HS Code: {config.hs_code}")
 
-                # -------------------------------------------------------
-                # Guard: Compare config to_date against date.today()
-                # -------------------------------------------------------
                 config_to_date = (
                     config.to_date.date()
                     if isinstance(config.to_date, datetime)
@@ -117,21 +110,12 @@ def process():
                     )
                     continue
 
-                # -------------------------------------------------------
-                # Prepare output file — truncate/clear before paginating
-                # -------------------------------------------------------
                 os.makedirs(OUTPUT_DIR, exist_ok=True)
                 file_path = os.path.join(OUTPUT_DIR, f"{config.hs_code}.csv")
-
-                # Clear the file before starting so we don't append to stale data
                 open(file_path, "w").close()
 
-                # -------------------------------------------------------
-                # Paginated fetch — write each batch immediately to CSV
-                # -------------------------------------------------------
                 range_start = 0
                 total_records = 0
-                last_date = None
                 first_batch = True
 
                 while True:
@@ -143,6 +127,7 @@ def process():
                         response = http.get(url, timeout=30)
                         response.raise_for_status()
                         data = response.json()
+                        print(f"  Received {len(data)} records")
                     except Exception as e:
                         print(f"  Request failed for {url}: {e}")
                         break
@@ -158,7 +143,7 @@ def process():
                     print(f"  Batch {range_start}-{range_end}: wrote {len(data)} records")
 
                     # -------------------------------------------------------
-                    # Track last date from this batch
+                    # CHANGED: Track last date and update DB after every batch
                     # -------------------------------------------------------
                     batch_df = pd.DataFrame(data)
                     date_col_candidates = [
@@ -174,10 +159,15 @@ def process():
                                 batch_max = batch_df[date_col].max()
                                 if pd.notnull(batch_max):
                                     batch_date = batch_max.date()
-                                    if last_date is None or batch_date > last_date:
-                                        last_date = batch_date
+                                    # CHANGED: Update config and commit after every batch
+                                    config.to_date = batch_date
+                                    session.commit()
+                                    print(f"  config date: {config.to_date} Updated config {config.id} to_date to {batch_date} (batch {range_start}-{range_end})")
                         except Exception as e:
                             print(f"  Date parsing failed for batch {range_start}-{range_end}: {e}")
+                    # -------------------------------------------------------
+                    # END OF CHANGE
+                    # -------------------------------------------------------
 
                     range_start += RANGE_STEP
 
@@ -187,15 +177,7 @@ def process():
 
                 print(f"  Saved {total_records} total records to {file_path}")
 
-                # -------------------------------------------------------
-                # Update to_date in DB
-                # -------------------------------------------------------
-                if last_date:
-                    config.to_date = last_date
-                    session.commit()
-                    print(f"  Updated config {config.id} to_date to {last_date}")
-                else:
-                    print("  Could not determine last data date. to_date not updated.")
+                # CHANGED: Removed the post-loop `if last_date:` update block — now handled per batch above
 
     finally:
         session.close()
@@ -205,16 +187,6 @@ def process():
 # Direct URL processing (CLI mode)
 # -------------------------------------------------------
 def fetch_all_from_url(url, range_step=RANGE_STEP, output_file=None, config_to_date=None):
-    """
-    Fetch paginated data from a base URL, writing each batch to CSV immediately.
-
-    If config_to_date is provided (as a date string 'YYYY-MM-DD' or date object),
-    it is compared against date.today() — processing is skipped when
-    config_to_date >= date.today().
-
-    # run this to test the script
-    # python process.py --url "https://api.example.com/KEY123/IN/import/2024-01-01/2024-02-28/0-10/A/85" --output "output/HS_Code-85.csv"
-    """
     parsed = urlparse(url)
     base = f"{parsed.scheme}://{parsed.netloc}"
 
@@ -224,9 +196,6 @@ def fetch_all_from_url(url, range_step=RANGE_STEP, output_file=None, config_to_d
         print("URL path does not match expected API format.")
         return
 
-    # -------------------------------------------------------
-    # Guard: Compare config_to_date against date.today()
-    # -------------------------------------------------------
     if config_to_date is not None:
         if isinstance(config_to_date, str):
             try:
@@ -247,9 +216,6 @@ def fetch_all_from_url(url, range_step=RANGE_STEP, output_file=None, config_to_d
             )
             return
 
-    # -------------------------------------------------------
-    # Prepare output file — truncate/clear before paginating
-    # -------------------------------------------------------
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     range_idx = -3
@@ -258,12 +224,8 @@ def fetch_all_from_url(url, range_step=RANGE_STEP, output_file=None, config_to_d
         hs_code_seg = segments[-1]
         output_file = os.path.join(OUTPUT_DIR, f"{hs_code_seg}.csv")
 
-    # Clear the file before starting
     open(output_file, "w").close()
 
-    # -------------------------------------------------------
-    # Paginated fetch — write each batch immediately to CSV
-    # -------------------------------------------------------
     range_start = 0
     total_records = 0
     first_batch = True
@@ -286,7 +248,6 @@ def fetch_all_from_url(url, range_step=RANGE_STEP, output_file=None, config_to_d
             if not data:
                 break
 
-            # Write this batch to CSV immediately
             write_batch_to_csv(output_file, data, write_header=first_batch)
             first_batch = False
             total_records += len(data)
@@ -308,20 +269,9 @@ def fetch_all_from_url(url, range_step=RANGE_STEP, output_file=None, config_to_d
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process API data to CSV")
 
-    parser.add_argument(
-        "--url",
-        help="Full API URL to fetch (must include range segment like 0-10)"
-    )
-    parser.add_argument(
-        "--output",
-        help="Output CSV file path"
-    )
-    parser.add_argument(
-        "--step",
-        type=int,
-        default=RANGE_STEP,
-        help="Range step size (default=10)"
-    )
+    parser.add_argument("--url", help="Full API URL to fetch (must include range segment like 0-10)")
+    parser.add_argument("--output", help="Output CSV file path")
+    parser.add_argument("--step", type=int, default=RANGE_STEP, help="Range step size (default=10)")
     parser.add_argument(
         "--config-to-date",
         dest="config_to_date",
