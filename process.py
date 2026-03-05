@@ -1,4 +1,5 @@
 import argparse
+import logging
 import requests
 import pandas as pd
 from sqlalchemy import create_engine
@@ -10,15 +11,30 @@ from urllib.parse import urlparse
 from datetime import datetime, date
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import uuid
+from dotenv import load_dotenv
+
+# Load .env file
+load_dotenv()
 
 # Docker container: postgres-db-3 on port 5434
-DATABASE_URL = "postgresql+psycopg2://sourin:admin@localhost:5434/config-db"
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 engine = create_engine(DATABASE_URL, echo=False)
 Session = sessionmaker(bind=engine)
 
 RANGE_STEP = 10
 OUTPUT_DIR = "output"
+
+# -------------------------------------------------------
+# Logging configuration
+# -------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 
 # -------------------------------------------------------
@@ -57,6 +73,8 @@ def build_url(config, range_start, range_end):
         f"{range_start}-{range_end}/"
         f"{config.operator}/{config.hs_code}"
     )
+    # custom URL format for mock API testing:
+    # return f"http://127.0.0.1:8000/{config.api_key}/{config.country}/{config.data_type}/{config.to_date}/2025-10-28/{range_start}-{range_end}/{config.operator}/{config.hs_code}"
 
 
 # -------------------------------------------------------
@@ -85,12 +103,15 @@ def process():
         configs = session.query(Config).filter(Config.active == True).all()
 
         if not configs:
-            print("No active configurations found.")
+            logger.info("No active configurations found.")
             return
 
         with create_http_session() as http:
             for config in configs:
-                print(f"\nProcessing HS Code: {config.hs_code}")
+                logger.info("Processing HS Code: %s", config.hs_code)
+
+                run_id = str(uuid.uuid4())
+                logger.info("Run ID             : %s", run_id)
 
                 config_to_date = (
                     config.to_date.date()
@@ -100,13 +121,14 @@ def process():
 
                 today = date.today()
 
-                print(f"  Config to_date: {config_to_date}")
-                print(f"  Today         : {today}")
+                logger.info("  Config to_date: %s", config_to_date)
+                logger.info("  Today         : %s", today)
 
                 if config_to_date >= today:
-                    print(
-                        f"  Skipping — config to_date ({config_to_date}) is today or in the future. "
-                        f"No new data expected."
+                    logger.info(
+                        "  Skipping — config to_date (%s) is today or in the future. "
+                        "No new data expected.",
+                        config_to_date,
                     )
                     continue
 
@@ -121,29 +143,33 @@ def process():
                 while True:
                     range_end = range_start + RANGE_STEP
                     url = build_url(config, range_start, range_end)
-                    print(f"url: {url}  | range: {range_start}-{range_end}")
+                    logger.info("url: %s  | range: %s-%s", url, range_start, range_end)
 
                     try:
                         response = http.get(url, timeout=30)
                         response.raise_for_status()
                         data = response.json()
-                        print(f"  Received {len(data)} records")
+                        logger.info("  Received %d records", len(data))
                     except Exception as e:
-                        print(f"  Request failed for {url}: {e}")
+                        logger.error("  Request failed for %s: %s", url, e)
                         break
 
                     if not data:
                         break
 
                     # Write this batch to CSV immediately
-                    write_batch_to_csv(file_path, data, write_header=first_batch)
-                    first_batch = False
-                    total_records += len(data)
+                    try:
+                        write_batch_to_csv(file_path, data, write_header=first_batch)
+                        first_batch = False
+                        total_records += len(data)
+                    except Exception as e:
+                        logger.error("  Failed to write batch %s-%s to CSV: %s", range_start, range_end, e)
+                        break
 
-                    print(f"  Batch {range_start}-{range_end}: wrote {len(data)} records")
+                    logger.info("  Batch %s-%s: wrote %d records", range_start, range_end, len(data))
 
                     # -------------------------------------------------------
-                    # CHANGED: Track last date and update DB after every batch
+                    # Track last date and update DB after every batch
                     # -------------------------------------------------------
                     batch_df = pd.DataFrame(data)
                     date_col_candidates = [
@@ -159,25 +185,31 @@ def process():
                                 batch_max = batch_df[date_col].max()
                                 if pd.notnull(batch_max):
                                     batch_date = batch_max.date()
-                                    # CHANGED: Update config and commit after every batch
                                     config.to_date = batch_date
+                                    config.number_of_rows = total_records
+                                    config.run_id = run_id
+                                    config.updated_date = datetime.utcnow()
                                     session.commit()
-                                    print(f"  config date: {config.to_date} Updated config {config.id} to_date to {batch_date} (batch {range_start}-{range_end})")
+                                    logger.info(
+                                        "  config date: %s — Updated config %s to_date to %s (batch %s-%s)",
+                                        config.to_date, config.id, batch_date, range_start, range_end,
+                                    )
                         except Exception as e:
-                            print(f"  Date parsing failed for batch {range_start}-{range_end}: {e}")
-                    # -------------------------------------------------------
-                    # END OF CHANGE
-                    # -------------------------------------------------------
+                            logger.warning("  Date parsing failed for batch %s-%s: %s", range_start, range_end, e)
+                    else:
+                        # No date column — still keep run tracking up to date
+                        config.number_of_rows = total_records
+                        config.run_id = run_id
+                        config.updated_date = datetime.utcnow()
+                        session.commit()
 
                     range_start += RANGE_STEP
 
                 if total_records == 0:
-                    print("  No data found.")
+                    logger.info("  No data found.")
                     continue
 
-                print(f"  Saved {total_records} total records to {file_path}")
-
-                # CHANGED: Removed the post-loop `if last_date:` update block — now handled per batch above
+                logger.info("  Saved %d total records to %s", total_records, file_path)
 
     finally:
         session.close()
@@ -186,6 +218,9 @@ def process():
 # -------------------------------------------------------
 # Direct URL processing (CLI mode)
 # -------------------------------------------------------
+# Run using CLI:
+# python process.py --url "http://127.0.0.1:8000/API123/India/export/2025-06-01/2025-06-30/0-10/and/HS_Code-85" --output "output/HS_Code-85.csv" --step 10 --config-to-date "2025-06-30"
+
 def fetch_all_from_url(url, range_step=RANGE_STEP, output_file=None, config_to_date=None):
     parsed = urlparse(url)
     base = f"{parsed.scheme}://{parsed.netloc}"
@@ -193,7 +228,7 @@ def fetch_all_from_url(url, range_step=RANGE_STEP, output_file=None, config_to_d
     segments = parsed.path.lstrip("/").split("/")
 
     if len(segments) < 7:
-        print("URL path does not match expected API format.")
+        logger.error("URL path does not match expected API format.")
         return
 
     if config_to_date is not None:
@@ -201,18 +236,19 @@ def fetch_all_from_url(url, range_step=RANGE_STEP, output_file=None, config_to_d
             try:
                 config_to_date = datetime.strptime(config_to_date, "%Y-%m-%d").date()
             except ValueError:
-                print(f"Invalid config_to_date format '{config_to_date}'. Expected YYYY-MM-DD.")
+                logger.error("Invalid config_to_date format '%s'. Expected YYYY-MM-DD.", config_to_date)
                 return
 
         today = date.today()
 
-        print(f"Config to_date: {config_to_date}")
-        print(f"Today         : {today}")
+        logger.info("Config to_date: %s", config_to_date)
+        logger.info("Today         : %s", today)
 
         if config_to_date >= today:
-            print(
-                f"Skipping — config to_date ({config_to_date}) is today or in the future. "
-                f"No new data expected."
+            logger.info(
+                "Skipping — config to_date (%s) is today or in the future. "
+                "No new data expected.",
+                config_to_date,
             )
             return
 
@@ -242,7 +278,7 @@ def fetch_all_from_url(url, range_step=RANGE_STEP, output_file=None, config_to_d
                 resp.raise_for_status()
                 data = resp.json()
             except Exception as e:
-                print(f"Request failed for {full_url}: {e}")
+                logger.error("Request failed for %s: %s", full_url, e)
                 break
 
             if not data:
@@ -252,15 +288,15 @@ def fetch_all_from_url(url, range_step=RANGE_STEP, output_file=None, config_to_d
             first_batch = False
             total_records += len(data)
 
-            print(f"Batch {range_start}-{range_end}: wrote {len(data)} records")
+            logger.info("Batch %s-%s: wrote %d records", range_start, range_end, len(data))
 
             range_start += range_step
 
     if total_records == 0:
-        print("No data found at the provided URL.")
+        logger.warning("No data found at the provided URL.")
         return
 
-    print(f"Saved {total_records} total records to {output_file}")
+    logger.info("Saved %d total records to %s", total_records, output_file)
 
 
 # -------------------------------------------------------
