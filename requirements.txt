@@ -6,3 +6,4 @@ pandas
 requests
 boto3
 python-dateutil
+python-dotenv

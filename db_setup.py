@@ -1,9 +1,9 @@
 # db_setup.py
 
-from sqlalchemy import create_engine, Column, String, Boolean, Date, Integer
+from sqlalchemy import create_engine, Column, String, Boolean, Date, Integer, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.engine import URL
-from datetime import date
+from datetime import date, datetime
 
 # 🔥 PostgreSQL connection using URL.create()
 # Docker container: postgres-db-3 on port 5434
@@ -22,7 +22,7 @@ Base = declarative_base()
 
 
 class Config(Base):
-    __tablename__ = "config"
+    __tablename__ = "config"   
 
     id = Column(Integer, primary_key=True)
     base_url = Column(String)
@@ -34,6 +34,12 @@ class Config(Base):
     operator = Column(String)
     hs_code = Column(String)
     active = Column(Boolean, default=True)
+
+    # ✅ New columns
+    number_of_rows = Column(Integer, default=0)
+    run_id = Column(String, unique=True, nullable=True)
+    created_date = Column(DateTime, default=datetime.utcnow)
+    updated_date = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 def seed():
@@ -48,7 +54,11 @@ def seed():
         to_date=date(2025, 6, 30),
         operator="and",
         hs_code="HS_Code-85",
-        active=True
+        active=True,
+
+        # ✅ New column values
+        number_of_rows=None,
+        run_id=None,
     )
 
     session.add(entry)

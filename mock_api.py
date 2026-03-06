@@ -10,7 +10,7 @@ MOCK_DB = []
 # Generate 50 records
 for i in range(50):
     MOCK_DB.append({
-        "date": "2025-06-15",
+        "date": "2025-10-18",
         "declaration_number": f"DEC{i+1}",
         "hs_code": "85",
         "country": "India",
